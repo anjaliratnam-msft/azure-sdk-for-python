@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO, SEEK_SET, UnsupportedOperation
 from time import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing_extensions import Protocol
 from threading import Lock
 from urllib.parse import (
     parse_qsl,
@@ -80,7 +81,7 @@ CRC64_HEADER = "x-ms-content-crc64"
 SM_HEADER = "x-ms-structured-body"
 SM_HEADER_V1_CRC64 = "XSM/1.0; properties=crc64"
 SM_LENGTH_HEADER = "x-ms-structured-content-length"
-SESSION_RETRIED_CONTEXT_KEY = "_session_retried"
+SESSION_BEARER_AUTH_KEY = "_session_bearer_auth"
 UTC = timezone.utc
 
 
@@ -119,14 +120,6 @@ def _analyze_request(request: "PipelineRequest") -> Optional[Tuple[str, str]]:
     container_name = segments[0]
     container_url = f"{parsed.scheme}://{parsed.netloc}/{container_name}"
     return container_name, container_url
-
-
-def _used_session_token(request: "PipelineRequest") -> Optional[str]:
-    """Use for distinguishing between a successful concurrent refresh and invalidated token."""
-    auth = request.http_request.headers.get("Authorization", "")
-    if not auth.startswith("Session "):
-        return None
-    return auth[len("Session ") :].split(":", 1)[0] or None
 
 
 def _apply_session_auth(
@@ -1036,8 +1029,21 @@ class Session:
         return now >= self.expires_at - diff
 
 
+class SessionProvider(Protocol):
+    """Creates, caches, and invalidates per-container sessions."""
+
+    def is_request_eligible(self, request: "PipelineRequest") -> bool:
+        ...
+
+    def get_session(self, request: "PipelineRequest") -> Optional[Session]:
+        ...
+
+    def invalidate_session(self, request: "PipelineRequest", current: Session) -> None:
+        ...
+
+
 class SessionCache:
-    """Thread-safe, container-level session cache for the sync stack.
+    """Thread-safe, container-level session provider for the sync stack.
 
     Concurrency model
     -----------------
@@ -1053,105 +1059,13 @@ class SessionCache:
     FALLBACK_COOLDOWN: timedelta = timedelta(minutes=5)
     """Cooldown applied to the fallback-to-bearer sentinel after an eligible create session failure."""
 
-    def __init__(self) -> None:
+    def __init__(self, session_client_factory: Callable[[str], Any]) -> None:
+        if session_client_factory is None:
+            raise ValueError("session_client_factory is required.")
+        self._session_client_factory = session_client_factory
         self._locks: Dict[str, Lock] = {}
         self._locks_guard: Lock = Lock()
         self._entry: Dict[str, Session] = {}
-
-    def lock_container(self, container_name: str) -> Lock:
-        """Return the per-container lock, creating it exactly once.
-
-        :param str container_name: The container to get the lock for.
-        :return: The single lock instance associated with the container.
-        :rtype: ~threading.Lock
-        """
-        # Easy path: lock already exists, and on free threads it falls to slow path
-        existing_lock = self._locks.get(container_name)
-        if existing_lock is not None:
-            return existing_lock
-        # Slow path: create exactly one lock per container
-        with self._locks_guard:
-            return self._locks.setdefault(container_name, Lock())
-
-    def get(self, container_name: str) -> Optional[Session]:
-        """Return a live session for the container, or None.
-
-        Lock-free and non-mutating. Expired entries are NOT deleted.
-        Instead, they are simply treated as a cache miss and overwritten on the next refresh.
-
-        :param str container_name: The container to look up.
-        :return: A live (non-expired) session, or None on miss/expiry.
-        :rtype: ~azure.storage.blob._shared.policies.Session or None
-        """
-        cached = self._entry.get(container_name, None)
-        if cached is None or cached.expired():
-            return None
-        return cached
-
-    def put(self, container_name: str, session_token: str, session_key: str, expires_at: datetime) -> None:
-        """Install a real session entry.
-
-        Caller must hold the lock at the container-level.
-
-        :param str container_name: The container the session belongs to.
-        :param str session_token: The session token to send as a header.
-        :param str session_key: The HMAC signing key for the session.
-        :param ~datetime.datetime expires_at: When the session expires.
-        """
-        self._entry[container_name] = Session(session_token, session_key, expires_at, is_fallback=False)
-
-    def put_fallback(self, container_name: str) -> None:
-        """Install a fallback-to-bearer sentinel for the cooldown window.
-
-        Caller must hold the lock at the container-level.
-
-        :param str container_name: The container to mark for bearer fallback.
-        """
-        self._entry[container_name] = Session(
-            None, None, datetime.now(UTC) + SessionCache.FALLBACK_COOLDOWN, is_fallback=True
-        )
-
-    def invalidate(self, container_name: str, session_token: Optional[str] = None) -> None:
-        cached = self._entry.get(container_name, None)
-        if cached is not None and cached.session_token == session_token:
-            self._entry.pop(container_name, None)
-
-
-class StorageSessionPolicy(HTTPPolicy):
-    """
-    A pipeline policy that selects between session token and bearer token authentication.
-
-    When enabled, eligible requests are authenticated with a session token.
-    The session token is cached to the container.
-
-    When disabled, all requests are delegated to the bearer token policy.
-    """
-
-
-    def __init__(
-        self,
-        *,
-        account_name: str,
-        session_client_factory: Callable[[str], Any],
-    ) -> None:
-        """Constructs a StorageSessionPolicy.
-
-        :keyword str account_name: Storage account name; used as the signer
-            identity when signing session-authenticated requests.
-        :keyword session_client_factory: A callable that, given a container URL,
-            returns a session-disabled generated client (AzureBlobStorage)
-            whose pipeline uses OAuth/bearer auth. Invoked to issue CreateSession.
-        :paramtype session_client_factory: Callable[[str], Any]
-        :raises ValueError: if `account_name` or `session_client_factory` is `None`.
-        """
-        if account_name is None or session_client_factory is None:
-            raise ValueError("account_name and session_client_factory are required.")
-        super().__init__()
-        self._account_name = account_name
-        self._session_client_factory = session_client_factory
-        self._enabled = True
-        self._cache = SessionCache()
-
 
     def _create_session(self, container_url: str) -> Tuple[str, str, datetime]:
         config = CreateSessionConfiguration(authentication_type="HMAC")
@@ -1159,30 +1073,145 @@ class StorageSessionPolicy(HTTPPolicy):
         response = client.container.create_session(create_session_configuration=config)
         return _extract_session(response)
 
-    def _refresh_session_token(self, container_name: str, container_url: str) -> Optional[Session]:
+    def lock_container(self, container_url: str) -> Lock:
+        """Return the per-container lock, creating it exactly once.
+
+        :param str container_url: The container to get the lock for.
+        :return: The single lock instance associated with the container.
+        :rtype: ~threading.Lock
+        """
+        # Easy path: lock already exists, and on free threads it falls to slow path
+        existing_lock = self._locks.get(container_url)
+        if existing_lock is not None:
+            return existing_lock
+        # Slow path: create exactly one lock per container
+        with self._locks_guard:
+            return self._locks.setdefault(container_url, Lock())
+
+    def get(self, container_url: str) -> Optional[Session]:
+        """Return a live session for the container, or None.
+
+        Lock-free and non-mutating. Expired entries are NOT deleted.
+        Instead, they are simply treated as a cache miss and overwritten on the next refresh.
+
+        :param str container_url: The container to look up.
+        :return: A live (non-expired) session, or None on miss/expiry.
+        :rtype: ~azure.storage.blob._shared.policies.Session or None
+        """
+        cached = self._entry.get(container_url, None)
+        if cached is None or cached.expired():
+            return None
+        return cached
+
+    def put(self, container_url: str, session_token: str, session_key: str, expires_at: datetime) -> None:
+        """Install a real session entry.
+
+        Caller must hold the lock at the container-level.
+
+        :param str container_url: The container the session belongs to.
+        :param str session_token: The session token to send as a header.
+        :param str session_key: The HMAC signing key for the session.
+        :param ~datetime.datetime expires_at: When the session expires.
+        """
+        self._entry[container_url] = Session(session_token, session_key, expires_at, is_fallback=False)
+
+    def put_fallback(self, container_url: str) -> None:
+        """Install a fallback-to-bearer sentinel for the cooldown window.
+
+        Caller must hold the lock at the container-level.
+
+        :param str container_url: The container to mark for bearer fallback.
+        """
+        self._entry[container_url] = Session(
+            None, None, datetime.now(UTC) + self.FALLBACK_COOLDOWN, is_fallback=True
+        )
+
+    def invalidate(self, container_url: str, session_token: Optional[str] = None) -> None:
+        """Drop the cached session if it still matches the rejected token.
+
+        :param str container_url: The container-scoped URL.
+        :param str session_token: The rejected token, or None if unknown.
+        """
+        with self.lock_container(container_url):
+            cached = self._entry.get(container_url, None)
+            if cached is not None and cached.session_token == session_token:
+                self._entry.pop(container_url, None)
+
+    def _refresh_session_token(self, container_url: str) -> Optional[Session]:
         """Acquire (or re-use) a session for the container under per-container single-flight.
 
-        :param str container_name: The container key for the cache and lock.
-        :param str container_url: The container-scoped URL for the CreateSession call.
+        :param str container_url: The container-scoped URL, used as the cache key
+            and for the CreateSession call.
         :return: A live session, a fallback sentinel, or `None` if unusable.
         :rtype: ~azure.storage.blob._shared.policies.Session or None
         """
-        with self._cache.lock_container(container_name):
-            existing = self._cache.get(container_name)
+        with self.lock_container(container_url):
+            existing = self.get(container_url)
             if existing is not None and not existing.expired():
                 return existing
             try:
                 token, key, expires_at = self._create_session(container_url)
-                self._cache.put(container_name, token, key, expires_at)
+                self.put(container_url, token, key, expires_at)
             except (AzureError, ValueError):
                 _LOGGER.warning(
                     "CreateSession failed for container '%s'; falling back to bearer for %d seconds.",
-                    container_name,
-                    int(SessionCache.FALLBACK_COOLDOWN.total_seconds()),
+                    container_url,
+                    int(self.FALLBACK_COOLDOWN.total_seconds()),
                     exc_info=True,
                 )
-                self._cache.put_fallback(container_name)
-            return self._cache.get(container_name)
+                self.put_fallback(container_url)
+            return self.get(container_url)
+
+    def get_session(self, container_url: str) -> Optional[Session]:
+        """Return a usable session for the container, creating one on a miss.
+
+        :param str container_url: The container-scoped URL.
+        :return: A live session, or None if the caller should use bearer auth.
+        :rtype: ~azure.storage.blob._shared.policies.Session or None
+        """
+        session = self.get(container_url)
+        if session is None:
+            # True miss/expiry (a live fallback sentinel is returned by get(),
+            # so we never reach refresh while the cooldown is active).
+            session = self._refresh_session_token(container_url)
+        if session is None or session.is_fallback:
+            return None
+        return session
+
+
+class StorageSessionPolicy(HTTPPolicy):
+    """
+    A pipeline policy that selects between session token and bearer token authentication.
+
+    Eligible requests are authenticated with a session token obtained from the
+    session provider. Everything else is left to the bearer token policy that
+    sits earlier in the pipeline.
+    """
+
+    def __init__(
+        self,
+        *,
+        account_name: str,
+        session_provider: SessionProvider,
+    ) -> None:
+        """Constructs a StorageSessionPolicy.
+
+        :keyword str account_name: Storage account name; used as the signer
+            identity when signing session-authenticated requests.
+        :keyword session_provider: Creates, caches, and invalidates per-container sessions.
+        :paramtype session_provider: ~azure.storage.blob._shared.policies.SessionProvider
+        :raises ValueError: if `account_name` or `session_provider` is `None`.
+        """
+        if account_name is None:
+            raise ValueError(
+                "Unable to determine the account name from the service URL. "
+                "Supply session_options.account_name when using a custom endpoint."
+            )
+        if session_provider is None:
+            raise ValueError("session_provider is required.")
+        super().__init__()
+        self._account_name = account_name
+        self._session_provider = session_provider
 
     def send(self, request: "PipelineRequest") -> "PipelineResponse":
         """Orchestrate session auth.
@@ -1191,84 +1220,57 @@ class StorageSessionPolicy(HTTPPolicy):
         :return: The pipeline response.
         :rtype: ~azure.core.pipeline.PipelineResponse
         """
-        container_name = self.on_request(request)
+        session = self.on_request(request)
         response = self.next.send(request)
-        return self.on_response(request, response, container_name)
+        return self.on_response(request, response, session)
 
-    def on_request(self, request: "PipelineRequest") -> Optional[str]:
+    def on_request(self, request: "PipelineRequest") -> Optional[Session]:
         """Stamp session auth if eligible, otherwise leave the bearer header intact.
 
         :param ~azure.core.pipeline.PipelineRequest request: The request to (maybe) sign.
-        :return: The container name if a session was applied, else None.
-        :rtype: str or None
+        :return: The session that was applied, else None.
+        :rtype: ~azure.storage.blob._shared.policies.Session or None
         """
-        if not self._enabled:
-            return None
-        analysis = _analyze_request(request)
-        if analysis is None:
-            return None
-        container_name, container_url = analysis
-
-        session = self._cache.get(container_name)
-        if session is None:
-            # True miss/expiry (a live fallback sentinel is returned by get(),
-            # so we never reach refresh while the cooldown is active).
-            session = self._refresh_session_token(container_name, container_url)
-
-        if session is None or session.is_fallback or not session.session_token or not session.session_key:
+        if not self._session_provider.is_request_eligible(request):
             return None
 
+        session = self._session_provider.get_session(request)
+        if session is None or not session.session_token or not session.session_key:
+            return None
+
+        # Kept so a 401 can serve this request with bearer instead of re-signing.
+        request.context.options[SESSION_BEARER_AUTH_KEY] = request.http_request.headers.get("Authorization")
         _apply_session_auth(request, session.session_token, session.session_key, self._account_name)
-        return container_name
+        return session
 
     def on_response(
         self,
         request: "PipelineRequest",
         response: "PipelineResponse",
-        container_name: Optional[str],
+        session: Optional[Session],
     ) -> "PipelineResponse":
-        """React to session-related failures: cooldown sentinel or one-shot re-acquire.
+        """On 401, invalidate the cached session and serve the request with bearer.
 
         :param ~azure.core.pipeline.PipelineRequest request: The original request.
         :param ~azure.core.pipeline.PipelineResponse response: The response to inspect.
-        :param container_name: Container that was session-signed, or `None` if bearer was used.
-        :type container_name: str or None
-        :return: The final response (possibly from a one-shot retry).
+        :param session: The session that signed the request, or `None` if bearer was used.
+        :type session: ~azure.storage.blob._shared.policies.Session or None
+        :return: The final response.
         :rtype: ~azure.core.pipeline.PipelineResponse
         """
-        if container_name is None:
+        if session is None:
             return response  # bearer was used; nothing session-related to react to
 
         status = response.http_response.status_code
-        error_code = response.http_response.headers.get("x-ms-error-code", "")
 
-        if error_code == StorageErrorCode.FEATURE_NOT_ENABLED:
-            _LOGGER.info("Session feature not enabled on this account; disabling session auth.")
-            self._enabled = False
+        # 401 → drop the cached session and serve this request with bearer.
+        if status == 401:
+            _LOGGER.info("Session authentication: HTTP 401; invalidating session and retrying with bearer.")
+            self._session_provider.invalidate_session(request, session)
+            bearer = request.context.options.get(SESSION_BEARER_AUTH_KEY)
+            if bearer:
+                request.http_request.headers["Authorization"] = bearer
+                return self.next.send(request)
             return response
-
-        # Unavailable / 5xx → negative-cache cooldown.
-        if error_code == StorageErrorCode.SESSIONS_UNAVAILABLE or status >= 500:
-            _LOGGER.warning(
-                "Session authentication: '%s' (HTTP %d) on container '%s'; bearer fallback for %d seconds.",
-                error_code or "5xx",
-                status,
-                container_name,
-                int(SessionCache.FALLBACK_COOLDOWN.total_seconds()),
-            )
-            with self._cache.lock_container(container_name):
-                self._cache.put_fallback(container_name)
-            return response
-
-        # 401 → invalidate + re-acquire ONCE, then resend.
-        if status == 401 and not request.context.options.get(SESSION_RETRIED_CONTEXT_KEY):
-            _LOGGER.info("Session authentication: HTTP 401 on '%s'; re-acquiring once.", container_name)
-            used_token = _used_session_token(request)
-            with self._cache.lock_container(container_name):
-                self._cache.invalidate(container_name, used_token)
-            request.context.options[SESSION_RETRIED_CONTEXT_KEY] = True
-            retried_container = self.on_request(request)
-            retried_response = self.next.send(request)
-            return self.on_response(request, retried_response, retried_container)
 
         return response
